@@ -109,7 +109,9 @@ resume and concurrency options:
 
 The script writes fetched image metadata to the state database as it runs. If the
 run is interrupted, rerun the same command and it will skip images already stored
-in the database.
+in the database. After a completed listing pass, images that are no longer
+returned by OCIR for the same scan scope are pruned from the image and reference
+tables before reports are written.
 
 Useful large-run options:
 
@@ -129,6 +131,14 @@ Useful large-run options:
   has one row per image-to-layer relationship.
 - `--include-ref-lists`: Include image/repository name lists in `layers.csv`.
   This is off by default because very shared layers can create huge CSV cells.
+- `--retention-created-days`: Flag deletion candidates created at least this
+  many days ago in `deletion_candidates.csv`. Default: `90`.
+- `--retention-last-pulled-days`: Flag deletion candidates not pulled within
+  this many days in `deletion_candidates.csv`. Default: `90`.
+- `--retention-repo-version-limit`: Flag images in repositories with more than
+  this many scanned images. Default: `10`.
+- `--retention-exclusive-bytes`: Flag images with at least this many exclusive
+  billable bytes. Default: `1073741824` (1 GiB).
 
 For sharding, run the script per repository OCID:
 
@@ -167,11 +177,28 @@ High-level regional totals:
 - Fetch error count.
 - Local unreferenced layer/manifest row counts from the SQLite state database.
 - Collection statistics for the run.
+- Report confidence status and reconciliation metrics.
+
+The estimated billable total counts only layer and manifest rows still
+referenced by scanned images. Local unreferenced rows are reported separately as
+diagnostic state-database leftovers and are not included in the billable total.
+
+The `confidence` section is a quick trust signal. It reports `PASS` when
+attribution totals reconcile and there are no fetch errors or local unreferenced
+rows. It reports `WARNING` when the math reconciles but scan completeness or
+local state deserves review. It reports `FAIL` if attribution totals do not
+reconcile to the estimated billable total.
 
 ### `dashboard.html`
 
 A standalone visual dashboard for a quick storage-utilization read:
 
+- Report confidence: reconciliation status, listed/fetched/skipped/failed image
+  counts, pruned stale images, fetch errors, attribution delta, and local
+  unreferenced bytes.
+- Retention policy signals: which configured retention criteria match the most
+  images, attributed bytes, and exclusive bytes.
+- Top deletion candidates ordered by exclusive billable bytes.
 - Physical object composition: referenced layer blobs, manifests, and any local
   unreferenced layer/manifest rows in the state database.
 - Image attribution by tag status: versioned images versus unversioned images,
@@ -210,6 +237,44 @@ deduplication.
 equally across all images that reference them. These values are designed to
 reconcile back to the regional estimated billable total.
 
+### `unversioned_images.csv`
+
+One row per image where both `version` and `versions` are empty. It uses the
+same columns as `images.csv` so the rows can be compared or joined directly.
+
+### `deletion_candidates.csv`
+
+Images that do not meet one or more configured retention criteria and should be
+reviewed as deletion candidates:
+
+- Unversioned image.
+- Never pulled.
+- Missing last-pulled timestamp.
+- Not pulled within `--retention-last-pulled-days`.
+- Created at least `--retention-created-days` ago.
+- Exclusive billable bytes greater than or equal to
+  `--retention-exclusive-bytes`.
+- Repository has more than `--retention-repo-version-limit` scanned images.
+
+Useful columns include:
+
+- `repository_name`
+- `repository_image_count`
+- `display_name`
+- `version`
+- `time_created`
+- `time_last_pulled`
+- `pull_count`
+- `exclusive_billable_bytes`
+- `equal_share_attributed_billable_bytes`
+- `exclusive_ratio`
+- `age_days`
+- `last_pulled_age_days`
+- `deletion_candidate_reason`
+
+This file is intended to guide review of retention policy and cleanup
+candidates. It is not an automatic deletion recommendation.
+
 ### `layers.csv`
 
 One row per unique layer digest:
@@ -221,6 +286,19 @@ One row per unique layer digest:
 
 Repository and image name lists are blank by default for scale. Pass
 `--include-ref-lists` to populate them.
+
+### `unreferenced_layers.csv`
+
+Layer rows in the local SQLite state database that are not referenced by any
+currently scanned image. These rows are excluded from the estimated billable
+total and are mostly useful for diagnosing stale local state after refreshes or
+scope changes.
+
+### `unreferenced_manifests.csv`
+
+Manifest rows in the local SQLite state database that are not referenced by any
+currently scanned image. These rows are excluded from the estimated billable
+total.
 
 ### `layer_refs.csv`
 
@@ -266,8 +344,10 @@ estimated billable total.
   report.
 - The default execution path uses a SQLite state database at
   `<output-dir>/ocir_inventory.sqlite`.
-- The report is based on OCI Container Registry image metadata, not billing
-  exports.
+- The report is an estimate based on OCI ContainerImage metadata. OCI billing
+  exports remain the source of truth for invoiced charges.
+- The report does not inspect the registry's raw blob store. It cannot prove
+  whether hidden orphan blobs exist outside the image metadata returned by OCI.
 - The unreferenced layer/blob check is limited to rows already present in the
   local SQLite state database. The scanner currently inventories blobs through
   image metadata, so an exact count of registry blobs that are not referenced by

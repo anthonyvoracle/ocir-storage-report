@@ -492,6 +492,48 @@ def list_image_summaries(
     yield from paged_items(client.list_container_images, compartment_id, **list_kwargs)
 
 
+def prune_unlisted_images(conn: sqlite3.Connection, listed_image_ids: Set[str]) -> int:
+    conn.execute("DROP TABLE IF EXISTS current_scan_images")
+    conn.execute("CREATE TEMP TABLE current_scan_images(id TEXT PRIMARY KEY)")
+    conn.executemany(
+        "INSERT INTO current_scan_images(id) VALUES (?)",
+        ((image_id,) for image_id in sorted(listed_image_ids)),
+    )
+    pruned = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM images
+        WHERE id NOT IN (SELECT id FROM current_scan_images)
+        """
+    ).fetchone()["count"]
+    conn.execute(
+        """
+        DELETE FROM image_layers
+        WHERE image_id NOT IN (SELECT id FROM current_scan_images)
+        """
+    )
+    conn.execute(
+        """
+        DELETE FROM image_manifests
+        WHERE image_id NOT IN (SELECT id FROM current_scan_images)
+        """
+    )
+    conn.execute(
+        """
+        DELETE FROM fetch_errors
+        WHERE image_id NOT IN (SELECT id FROM current_scan_images)
+        """
+    )
+    conn.execute(
+        """
+        DELETE FROM images
+        WHERE id NOT IN (SELECT id FROM current_scan_images)
+        """
+    )
+    conn.execute("DROP TABLE current_scan_images")
+    return int(pruned)
+
+
 def collect_images_to_db(
     conn: sqlite3.Connection,
     oci: Any,
@@ -512,7 +554,15 @@ def collect_images_to_db(
     fail_fast: bool,
 ) -> Dict[str, int]:
     pending: Dict[Future[Dict[str, Any]], Dict[str, str]] = {}
-    stats = {"listed": 0, "submitted": 0, "skipped": 0, "fetched": 0, "failed": 0}
+    stats = {
+        "listed": 0,
+        "submitted": 0,
+        "skipped": 0,
+        "fetched": 0,
+        "failed": 0,
+        "pruned": 0,
+    }
+    listed_image_ids: Set[str] = set()
     started = time.monotonic()
 
     def drain(completed: Iterable[Future[Dict[str, Any]]]) -> None:
@@ -557,6 +607,7 @@ def collect_images_to_db(
             image_id = as_str(getattr(summary, "id", ""))
             if not image_id:
                 continue
+            listed_image_ids.add(image_id)
             if resume and not refresh and already_fetched(conn, image_id):
                 stats["skipped"] += 1
                 continue
@@ -573,6 +624,7 @@ def collect_images_to_db(
             done, _ = wait(pending.keys(), return_when=FIRST_COMPLETED)
             drain(done)
 
+    stats["pruned"] = prune_unlisted_images(conn, listed_image_ids)
     conn.commit()
     return stats
 
@@ -1074,8 +1126,19 @@ def pct(part: int, total: int) -> float:
     return part * 100.0 / total
 
 
-def query_rows(conn: sqlite3.Connection, query: str) -> List[Dict[str, Any]]:
-    return [dict(row) for row in conn.execute(query)]
+def query_rows(
+    conn: sqlite3.Connection,
+    query: str,
+    params: Sequence[Any] = (),
+) -> List[Dict[str, Any]]:
+    return [dict(row) for row in conn.execute(query, params)]
+
+
+def confidence_status_class(status: str) -> str:
+    lowered = status.lower()
+    if lowered in {"pass", "warning", "fail"}:
+        return lowered
+    return "warning"
 
 
 def write_storage_visuals(
@@ -1209,6 +1272,232 @@ def write_storage_visuals(
         LIMIT 12
         """,
     )
+    retention_policy = summary.get("retention_policy", {})
+    retention_created_days = int(retention_policy.get("created_days", 90))
+    retention_last_pulled_days = int(retention_policy.get("last_pulled_days", 90))
+    retention_repo_version_limit = int(
+        retention_policy.get("repository_image_limit", 10)
+    )
+    retention_exclusive_bytes = int(
+        retention_policy.get("exclusive_bytes", 1024 * 1024 * 1024)
+    )
+    retention_criteria_rows = query_rows(
+        conn,
+        f"""
+        WITH repo_counts AS (
+            SELECT repository_id, COUNT(*) AS repository_image_count
+            FROM images
+            GROUP BY repository_id
+        ),
+        base AS (
+            SELECT
+                i.id,
+                i.version,
+                i.versions,
+                i.pull_count,
+                i.time_created,
+                i.time_last_pulled,
+                rc.repository_image_count,
+                a.exclusive_billable_bytes,
+                a.equal_share_attributed_billable_bytes
+            FROM images i
+            JOIN image_attribution a ON a.image_id = i.id
+            JOIN repo_counts rc ON rc.repository_id = i.repository_id
+        ),
+        criteria AS (
+            SELECT
+                'Unversioned images' AS criterion,
+                id,
+                exclusive_billable_bytes,
+                equal_share_attributed_billable_bytes,
+                'Both version fields are empty.' AS note
+            FROM base
+            WHERE TRIM(COALESCE(version, '')) = ''
+              AND TRIM(COALESCE(versions, '')) = ''
+            UNION ALL
+            SELECT
+                'Never pulled',
+                id,
+                exclusive_billable_bytes,
+                equal_share_attributed_billable_bytes,
+                'Pull count is zero.'
+            FROM base
+            WHERE pull_count = 0
+            UNION ALL
+            SELECT
+                'No last-pulled timestamp',
+                id,
+                exclusive_billable_bytes,
+                equal_share_attributed_billable_bytes,
+                'No time_last_pulled value was returned.'
+            FROM base
+            WHERE TRIM(COALESCE(time_last_pulled, '')) = ''
+            UNION ALL
+            SELECT
+                'Not pulled in {retention_last_pulled_days}+ days',
+                id,
+                exclusive_billable_bytes,
+                equal_share_attributed_billable_bytes,
+                'Last pull is older than the configured retention window.'
+            FROM base
+            WHERE TRIM(COALESCE(time_last_pulled, '')) <> ''
+              AND CAST(julianday('now') - julianday(time_last_pulled) AS INTEGER) >= ?
+            UNION ALL
+            SELECT
+                'Created {retention_created_days}+ days ago',
+                id,
+                exclusive_billable_bytes,
+                equal_share_attributed_billable_bytes,
+                'Image creation time is older than the configured retention window.'
+            FROM base
+            WHERE TRIM(COALESCE(time_created, '')) <> ''
+              AND CAST(julianday('now') - julianday(time_created) AS INTEGER) >= ?
+            UNION ALL
+            SELECT
+                'High exclusive storage',
+                id,
+                exclusive_billable_bytes,
+                equal_share_attributed_billable_bytes,
+                'Exclusive billable bytes meet or exceed {fmt_bytes(retention_exclusive_bytes)}.'
+            FROM base
+            WHERE exclusive_billable_bytes >= ?
+            UNION ALL
+            SELECT
+                'Repository over {retention_repo_version_limit} images',
+                id,
+                exclusive_billable_bytes,
+                equal_share_attributed_billable_bytes,
+                'Repository scanned image count exceeds the configured limit.'
+            FROM base
+            WHERE repository_image_count > ?
+        )
+        SELECT
+            criterion,
+            COUNT(DISTINCT id) AS image_count,
+            COALESCE(SUM(exclusive_billable_bytes), 0) AS exclusive_bytes,
+            COALESCE(SUM(equal_share_attributed_billable_bytes), 0)
+                AS attributed_bytes,
+            note
+        FROM criteria
+        GROUP BY criterion, note
+        ORDER BY attributed_bytes DESC, image_count DESC, criterion
+        """,
+        (
+            retention_last_pulled_days,
+            retention_created_days,
+            retention_exclusive_bytes,
+            retention_repo_version_limit,
+        ),
+    )
+    top_deletion_candidate_rows = query_rows(
+        conn,
+        """
+        WITH repo_counts AS (
+            SELECT repository_id, COUNT(*) AS repository_image_count
+            FROM images
+            GROUP BY repository_id
+        ),
+        deletion_base AS (
+            SELECT
+                i.repository_name,
+                i.display_name,
+                i.version,
+                i.versions,
+                i.id AS image_id,
+                i.pull_count,
+                i.time_created,
+                i.time_last_pulled,
+                rc.repository_image_count,
+                a.exclusive_billable_bytes,
+                a.equal_share_attributed_billable_bytes,
+                CASE
+                    WHEN TRIM(COALESCE(i.time_created, '')) <> ''
+                    THEN CAST(julianday('now') - julianday(i.time_created) AS INTEGER)
+                    ELSE NULL
+                END AS age_days,
+                CASE
+                    WHEN TRIM(COALESCE(i.time_last_pulled, '')) <> ''
+                    THEN CAST(julianday('now') - julianday(i.time_last_pulled) AS INTEGER)
+                    ELSE NULL
+                END AS last_pulled_age_days,
+                TRIM(
+                    CASE
+                        WHEN TRIM(COALESCE(i.version, '')) = ''
+                          AND TRIM(COALESCE(i.versions, '')) = ''
+                        THEN 'unversioned image; '
+                        ELSE ''
+                    END
+                    || CASE
+                        WHEN i.pull_count = 0 THEN 'never pulled; '
+                        ELSE ''
+                    END
+                    || CASE
+                        WHEN TRIM(COALESCE(i.time_last_pulled, '')) = ''
+                        THEN 'no last pulled timestamp; '
+                        ELSE ''
+                    END
+                    || CASE
+                        WHEN TRIM(COALESCE(i.time_last_pulled, '')) <> ''
+                          AND CAST(julianday('now') - julianday(i.time_last_pulled)
+                              AS INTEGER) >= ?
+                        THEN 'not pulled within retention window; '
+                        ELSE ''
+                    END
+                    || CASE
+                        WHEN TRIM(COALESCE(i.time_created, '')) <> ''
+                          AND CAST(julianday('now') - julianday(i.time_created)
+                              AS INTEGER) >= ?
+                        THEN 'older than retention window; '
+                        ELSE ''
+                    END
+                    || CASE
+                        WHEN a.exclusive_billable_bytes >= ?
+                        THEN 'high exclusive billable bytes; '
+                        ELSE ''
+                    END
+                    || CASE
+                        WHEN rc.repository_image_count > ?
+                        THEN 'repository exceeds image count limit; '
+                        ELSE ''
+                    END,
+                    '; '
+                ) AS deletion_candidate_reason
+            FROM images i
+            JOIN image_attribution a ON a.image_id = i.id
+            JOIN repo_counts rc ON rc.repository_id = i.repository_id
+        )
+        SELECT
+            repository_name,
+            display_name,
+            version,
+            versions,
+            image_id,
+            pull_count,
+            time_created,
+            time_last_pulled,
+            repository_image_count,
+            exclusive_billable_bytes,
+            equal_share_attributed_billable_bytes,
+            age_days,
+            last_pulled_age_days,
+            deletion_candidate_reason
+        FROM deletion_base
+        WHERE deletion_candidate_reason <> ''
+        ORDER BY
+            exclusive_billable_bytes DESC,
+            equal_share_attributed_billable_bytes DESC,
+            repository_name,
+            display_name,
+            image_id
+        LIMIT 12
+        """,
+        (
+            retention_last_pulled_days,
+            retention_created_days,
+            retention_exclusive_bytes,
+            retention_repo_version_limit,
+        ),
+    )
 
     breakdown_rows = object_rows + tag_rows + reuse_rows
     breakdown_fields = [
@@ -1292,6 +1581,126 @@ def write_storage_visuals(
             )
         return "".join(bars) or '<div class="empty">No repositories found</div>'
 
+    def retention_criteria_view(rows: Sequence[Dict[str, Any]]) -> str:
+        max_bytes = max(
+            (int(row["attributed_bytes"] or 0) for row in rows),
+            default=0,
+        )
+        items = []
+        for row in rows:
+            attributed_bytes = int(row["attributed_bytes"] or 0)
+            exclusive_bytes = int(row["exclusive_bytes"] or 0)
+            width = pct(attributed_bytes, max_bytes)
+            items.append(
+                '<div class="retention-row">'
+                '<div>'
+                f'<div class="retention-name">{esc(row["criterion"])}</div>'
+                f'<div class="muted">{esc(row["note"])}</div>'
+                "</div>"
+                '<div class="retention-meter">'
+                f'<span style="width:{width:.4f}%"></span>'
+                "</div>"
+                '<div class="retention-stats">'
+                f'<strong>{int(row["image_count"] or 0):,}</strong> images'
+                f'<br><span>{esc(fmt_bytes(attributed_bytes))} attributed</span>'
+                f'<br><span>{esc(fmt_bytes(exclusive_bytes))} exclusive</span>'
+                "</div>"
+                "</div>"
+            )
+        return "".join(items) or '<div class="empty">No retention criteria matched</div>'
+
+    def top_deletion_candidates(rows: Sequence[Dict[str, Any]]) -> str:
+        max_bytes = max(
+            (int(row["exclusive_billable_bytes"] or 0) for row in rows),
+            default=0,
+        )
+        items = []
+        for row in rows:
+            exclusive_bytes = int(row["exclusive_billable_bytes"] or 0)
+            attributed_bytes = int(row["equal_share_attributed_billable_bytes"] or 0)
+            width = pct(exclusive_bytes, max_bytes)
+            version = row["version"] or row["versions"] or "unversioned"
+            age = row["age_days"] if row["age_days"] is not None else ""
+            pulled_age = (
+                row["last_pulled_age_days"]
+                if row["last_pulled_age_days"] is not None
+                else ""
+            )
+            items.append(
+                '<div class="candidate-row">'
+                '<div>'
+                f'<div class="retention-name">{esc(row["display_name"])}</div>'
+                f'<div class="muted">{esc(row["repository_name"])} | {esc(version)}</div>'
+                f'<div class="candidate-reason">{esc(row["deletion_candidate_reason"])}</div>'
+                "</div>"
+                '<div class="retention-meter">'
+                f'<span style="width:{width:.4f}%"></span>'
+                "</div>"
+                '<div class="retention-stats">'
+                f'<strong>{esc(fmt_bytes(exclusive_bytes))}</strong> exclusive'
+                f'<br><span>{esc(fmt_bytes(attributed_bytes))} attributed</span>'
+                f'<br><span>pulls {int(row["pull_count"] or 0):,}'
+                f' | age {esc(age)}d | pulled {esc(pulled_age)}d</span>'
+                "</div>"
+                "</div>"
+            )
+        return "".join(items) or '<div class="empty">No deletion candidates found</div>'
+
+    object_visual_total = sum(int(row["size_bytes"] or 0) for row in object_rows)
+    reuse_visual_total = sum(int(row["size_bytes"] or 0) for row in reuse_rows)
+    confidence = summary.get("confidence", {})
+    confidence_status = str(confidence.get("status", "WARNING"))
+    confidence_metrics = confidence.get("metrics", {})
+    confidence_class = confidence_status_class(confidence_status)
+    confidence_reason = confidence.get(
+        "reason",
+        "Confidence details were not available for this report.",
+    )
+    confidence_html = f"""
+  <section class="confidence confidence-{esc(confidence_class)}">
+    <div>
+      <h2>Report Confidence</h2>
+      <div class="muted">{esc(confidence_reason)}</div>
+    </div>
+    <div class="confidence-status">{esc(confidence_status)}</div>
+    <div class="confidence-grid">
+      <div>Listed<strong>{int(confidence_metrics.get("listed_images", 0)):,}</strong></div>
+      <div>Fetched<strong>{int(confidence_metrics.get("fetched_images", 0)):,}</strong></div>
+      <div>Skipped<strong>{int(confidence_metrics.get("skipped_images", 0)):,}</strong></div>
+      <div>Failed<strong>{int(confidence_metrics.get("failed_fetches", 0)):,}</strong></div>
+      <div>Pruned<strong>{int(confidence_metrics.get("pruned_images", 0)):,}</strong></div>
+      <div>Fetch errors<strong>{int(confidence_metrics.get("fetch_errors", 0)):,}</strong></div>
+      <div>Attribution delta<strong>{esc(fmt_bytes(abs(int(confidence_metrics.get("attribution_delta_bytes", 0)))))}</strong></div>
+      <div>Local unreferenced<strong>{esc(fmt_bytes(int(confidence_metrics.get("local_unreferenced_bytes", 0))))}</strong></div>
+    </div>
+  </section>
+"""
+    retention_html = f"""
+  <section>
+    <h2>Retention Policy Signals</h2>
+    <div class="policy-grid">
+      <div>Created age<strong>{retention_created_days:,}+ days</strong></div>
+      <div>Last pulled<strong>{retention_last_pulled_days:,}+ days</strong></div>
+      <div>Repo image limit<strong>{retention_repo_version_limit:,}</strong></div>
+      <div>Exclusive storage<strong>{esc(fmt_bytes(retention_exclusive_bytes))}+</strong></div>
+    </div>
+    <div class="muted retention-help">
+      Criteria overlap by design. Use this view to see which retention policy
+      knobs identify the most attributed and exclusive storage outside the
+      configured retention targets.
+    </div>
+    {retention_criteria_view(retention_criteria_rows)}
+  </section>
+
+  <section>
+    <h2>Top Deletion Candidates</h2>
+    <div class="muted retention-help">
+      Ordered by exclusive billable bytes first, because exclusive-heavy images
+      are more likely to free storage when removed.
+    </div>
+    {top_deletion_candidates(top_deletion_candidate_rows)}
+  </section>
+"""
     generated_at = esc(summary["generated_at"])
     report_html = f"""<!doctype html>
 <html lang="en">
@@ -1357,6 +1766,113 @@ def write_storage_visuals(
       display: block;
       font-size: 19px;
       margin-top: 2px;
+    }}
+    .confidence {{
+      display: grid;
+      grid-template-columns: minmax(180px, 1fr) auto;
+      gap: 14px;
+      align-items: start;
+      border: 1px solid var(--line);
+      border-left-width: 6px;
+      border-radius: 6px;
+      padding: 14px;
+      margin: 18px 0 24px;
+      background: var(--panel);
+    }}
+    .confidence-pass {{
+      border-left-color: #2f6f73;
+    }}
+    .confidence-warning {{
+      border-left-color: #c89d2d;
+    }}
+    .confidence-fail {{
+      border-left-color: #d35d33;
+    }}
+    .confidence-status {{
+      font-weight: 700;
+      letter-spacing: 0;
+      padding: 4px 8px;
+      border-radius: 4px;
+      background: #fff;
+      border: 1px solid var(--line);
+    }}
+    .confidence-grid {{
+      grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 2px;
+    }}
+    .confidence-grid div {{
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      padding: 8px;
+      color: var(--muted);
+    }}
+    .confidence-grid strong {{
+      display: block;
+      color: var(--ink);
+      margin-top: 2px;
+    }}
+    .policy-grid {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+      margin: 8px 0 10px;
+    }}
+    .policy-grid div {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      padding: 8px;
+      color: var(--muted);
+    }}
+    .policy-grid strong {{
+      display: block;
+      color: var(--ink);
+      margin-top: 2px;
+    }}
+    .retention-help {{
+      margin-bottom: 10px;
+    }}
+    .retention-row,
+    .candidate-row {{
+      display: grid;
+      grid-template-columns: minmax(240px, 1.4fr) minmax(180px, 1fr) 160px;
+      gap: 10px;
+      align-items: center;
+      padding: 9px 0;
+      border-bottom: 1px solid var(--line);
+    }}
+    .retention-name {{
+      font-weight: 650;
+      overflow-wrap: anywhere;
+    }}
+    .candidate-reason {{
+      color: var(--muted);
+      margin-top: 3px;
+      overflow-wrap: anywhere;
+    }}
+    .retention-meter {{
+      height: 16px;
+      background: var(--bar-bg);
+      border-radius: 4px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+    }}
+    .retention-meter span {{
+      display: block;
+      height: 100%;
+      background: #6f5aa8;
+    }}
+    .retention-stats {{
+      text-align: right;
+      white-space: nowrap;
+      color: var(--muted);
+    }}
+    .retention-stats strong {{
+      color: var(--ink);
     }}
     .grid {{
       display: grid;
@@ -1450,6 +1966,26 @@ def write_storage_visuals(
       .summary {{
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }}
+      .confidence {{
+        display: block;
+      }}
+      .confidence-status {{
+        display: inline-block;
+        margin-top: 10px;
+      }}
+      .confidence-grid {{
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }}
+      .policy-grid {{
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }}
+      .retention-row,
+      .candidate-row {{
+        grid-template-columns: 1fr;
+      }}
+      .retention-stats {{
+        text-align: left;
+      }}
       .repo-row {{
         grid-template-columns: 1fr;
       }}
@@ -1476,13 +2012,17 @@ def write_storage_visuals(
     <div class="metric">Images / repos<strong>{int(summary["image_count"]):,} / {int(summary["repository_count"]):,}</strong></div>
   </div>
 
+  {confidence_html}
+
+  {retention_html}
+
   <div class="grid">
     <section>
       <h2>Physical Object Composition</h2>
-      {segment_bar(object_rows, billable_total)}
+      {segment_bar(object_rows, object_visual_total)}
       <table>
         <thead><tr><th>Category</th><th class="num">Items</th><th class="num">Size</th><th class="num">Share</th></tr></thead>
-        <tbody>{legend(object_rows, billable_total)}</tbody>
+        <tbody>{legend(object_rows, object_visual_total)}</tbody>
       </table>
     </section>
 
@@ -1498,10 +2038,10 @@ def write_storage_visuals(
 
   <section>
     <h2>Layer Reuse</h2>
-    {segment_bar(reuse_rows, int(summary["unique_layer_total_bytes"]))}
+    {segment_bar(reuse_rows, reuse_visual_total)}
     <table>
       <thead><tr><th>Category</th><th class="num">Layers</th><th class="num">Size</th><th class="num">Share of layers</th></tr></thead>
-      <tbody>{legend(reuse_rows, int(summary["unique_layer_total_bytes"]))}</tbody>
+      <tbody>{legend(reuse_rows, reuse_visual_total)}</tbody>
     </table>
   </section>
 
@@ -1511,10 +2051,9 @@ def write_storage_visuals(
   </section>
 
   <div class="note">
-    The unreferenced layer/blob view is limited to rows in the local state database.
-    This scanner inventories blobs through image metadata; an exact orphan blob count
-    requires an independent registry blob inventory source, if OCIR exposes one for
-    your tenancy.
+    This report estimates OCIR storage from OCI ContainerImage metadata. It does
+    not inspect the registry's raw blob store, does not prove hidden orphan blob
+    counts, and does not replace OCI billing exports for invoiced charges.
   </div>
 </main>
 </body>
@@ -1531,6 +2070,10 @@ def write_report_from_db(
     include_subtree: bool,
     include_ref_lists: bool,
     skip_layer_refs: bool,
+    retention_created_days: int = 90,
+    retention_last_pulled_days: int = 90,
+    retention_repo_version_limit: int = 10,
+    retention_exclusive_bytes: int = 1024 * 1024 * 1024,
     stats: Optional[Dict[str, int]] = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1541,14 +2084,44 @@ def write_report_from_db(
         SELECT
             (SELECT COUNT(*) FROM images) AS image_count,
             (SELECT COUNT(DISTINCT repository_id) FROM images) AS repository_count,
-            (SELECT COUNT(*) FROM layers) AS unique_layer_count,
-            (SELECT COUNT(*) FROM manifests) AS unique_manifest_count,
+            (
+                SELECT COUNT(*)
+                FROM layers l
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM image_layers il
+                    WHERE il.layer_digest = l.digest
+                )
+            ) AS unique_layer_count,
+            (
+                SELECT COUNT(*)
+                FROM manifests m
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM image_manifests im
+                    WHERE im.manifest_digest = m.digest
+                )
+            ) AS unique_manifest_count,
             (SELECT COALESCE(SUM(layers_size_in_bytes + manifest_size_in_bytes), 0)
                 FROM images) AS naive_image_total_bytes,
-            (SELECT COALESCE(SUM(size_in_bytes), 0) FROM layers)
-                AS unique_layer_total_bytes,
-            (SELECT COALESCE(SUM(size_in_bytes), 0) FROM manifests)
-                AS unique_manifest_total_bytes,
+            (
+                SELECT COALESCE(SUM(l.size_in_bytes), 0)
+                FROM layers l
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM image_layers il
+                    WHERE il.layer_digest = l.digest
+                )
+            ) AS unique_layer_total_bytes,
+            (
+                SELECT COALESCE(SUM(m.size_in_bytes), 0)
+                FROM manifests m
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM image_manifests im
+                    WHERE im.manifest_digest = m.digest
+                )
+            ) AS unique_manifest_total_bytes,
             (SELECT COUNT(*) FROM fetch_errors) AS fetch_error_count
         """
     ).fetchone()
@@ -1603,6 +2176,48 @@ def write_report_from_db(
         FROM image_attribution
         """
     ).fetchone()["total"]
+    repository_attributed_total = conn.execute(
+        """
+        SELECT COALESCE(SUM(repository_total), 0) AS total
+        FROM (
+            SELECT SUM(a.equal_share_attributed_billable_bytes) AS repository_total
+            FROM images i
+            JOIN image_attribution a ON a.image_id = i.id
+            GROUP BY i.repository_id
+        )
+        """
+    ).fetchone()["total"]
+
+    stats_data = stats or {}
+    local_unreferenced_layer_bytes = int(unreferenced["local_unreferenced_layer_bytes"])
+    local_unreferenced_manifest_bytes = int(
+        unreferenced["local_unreferenced_manifest_bytes"]
+    )
+    local_unreferenced_bytes = (
+        local_unreferenced_layer_bytes + local_unreferenced_manifest_bytes
+    )
+    attribution_delta = int(attributed_total) - estimated_billable_total
+    repository_delta = int(repository_attributed_total) - estimated_billable_total
+    confidence_status = "PASS"
+    confidence_reasons = []
+    if attribution_delta != 0 or repository_delta != 0:
+        confidence_status = "FAIL"
+        confidence_reasons.append("billable attribution totals do not reconcile")
+    if int(totals["fetch_error_count"]) or int(stats_data.get("failed", 0)):
+        if confidence_status != "FAIL":
+            confidence_status = "WARNING"
+        confidence_reasons.append("one or more image metadata fetches failed")
+    if local_unreferenced_bytes:
+        if confidence_status != "FAIL":
+            confidence_status = "WARNING"
+        confidence_reasons.append(
+            "local state contains unreferenced layer or manifest rows excluded from billable total"
+        )
+    confidence_reason = (
+        "; ".join(confidence_reasons)
+        if confidence_reasons
+        else "all report reconciliation checks passed"
+    )
 
     summary = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -1624,27 +2239,54 @@ def write_report_from_db(
         "local_unreferenced_layer_count": int(
             unreferenced["local_unreferenced_layer_count"]
         ),
-        "local_unreferenced_layer_bytes": int(
-            unreferenced["local_unreferenced_layer_bytes"]
-        ),
-        "local_unreferenced_layer_human": fmt_bytes(
-            int(unreferenced["local_unreferenced_layer_bytes"])
-        ),
+        "local_unreferenced_layer_bytes": local_unreferenced_layer_bytes,
+        "local_unreferenced_layer_human": fmt_bytes(local_unreferenced_layer_bytes),
         "local_unreferenced_manifest_count": int(
             unreferenced["local_unreferenced_manifest_count"]
         ),
-        "local_unreferenced_manifest_bytes": int(
-            unreferenced["local_unreferenced_manifest_bytes"]
-        ),
+        "local_unreferenced_manifest_bytes": local_unreferenced_manifest_bytes,
         "local_unreferenced_manifest_human": fmt_bytes(
-            int(unreferenced["local_unreferenced_manifest_bytes"])
+            local_unreferenced_manifest_bytes
         ),
         "equal_share_attributed_total_bytes": int(attributed_total),
         "equal_share_attributed_total_human": fmt_bytes(int(attributed_total)),
+        "repository_attributed_total_bytes": int(repository_attributed_total),
+        "repository_attributed_total_human": fmt_bytes(
+            int(repository_attributed_total)
+        ),
         "dedup_savings_bytes": naive_total - estimated_billable_total,
         "dedup_savings_human": fmt_bytes(naive_total - estimated_billable_total),
         "fetch_error_count": int(totals["fetch_error_count"]),
-        "collection_stats": stats or {},
+        "collection_stats": stats_data,
+        "retention_policy": {
+            "created_days": retention_created_days,
+            "last_pulled_days": retention_last_pulled_days,
+            "repository_image_limit": retention_repo_version_limit,
+            "exclusive_bytes": retention_exclusive_bytes,
+            "exclusive_human": fmt_bytes(retention_exclusive_bytes),
+        },
+        "confidence": {
+            "status": confidence_status,
+            "reason": confidence_reason,
+            "checks": {
+                "equal_share_attribution_reconciles": attribution_delta == 0,
+                "repository_attribution_reconciles": repository_delta == 0,
+                "fetch_errors_absent": int(totals["fetch_error_count"]) == 0,
+            },
+            "metrics": {
+                "listed_images": int(stats_data.get("listed", 0)),
+                "fetched_images": int(stats_data.get("fetched", 0)),
+                "skipped_images": int(stats_data.get("skipped", 0)),
+                "failed_fetches": int(stats_data.get("failed", 0)),
+                "pruned_images": int(stats_data.get("pruned", 0)),
+                "fetch_errors": int(totals["fetch_error_count"]),
+                "attribution_delta_bytes": attribution_delta,
+                "repository_delta_bytes": repository_delta,
+                "local_unreferenced_bytes": local_unreferenced_bytes,
+                "local_unreferenced_layer_bytes": local_unreferenced_layer_bytes,
+                "local_unreferenced_manifest_bytes": local_unreferenced_manifest_bytes,
+            },
+        },
         "note": (
             "Estimated billable total is unique layer blobs plus unique image "
             "manifest bytes from ContainerImage metadata. OCI billing exports "
@@ -1693,6 +2335,206 @@ def write_report_from_db(
         JOIN image_attribution a ON a.image_id = i.id
         ORDER BY i.repository_name, i.display_name, i.id
         """,
+    )
+    write_query_csv(
+        conn,
+        output_dir / "unversioned_images.csv",
+        IMAGE_FIELDS,
+        """
+        SELECT
+            i.region,
+            i.compartment_id,
+            i.repository_name,
+            i.repository_id,
+            i.id AS image_id,
+            i.display_name,
+            i.digest,
+            i.version,
+            i.versions,
+            i.lifecycle_state,
+            COALESCE((
+                SELECT COUNT(*) FROM image_layers il WHERE il.image_id = i.id
+            ), 0) AS layer_count,
+            i.layers_size_in_bytes AS layers_size_bytes,
+            i.manifest_size_in_bytes AS manifest_size_bytes,
+            i.layers_size_in_bytes + i.manifest_size_in_bytes
+                AS image_naive_total_bytes,
+            a.unique_layer_bytes_referenced,
+            a.shared_layer_bytes_referenced,
+            a.exclusive_layer_bytes,
+            a.exclusive_billable_bytes,
+            a.equal_share_attributed_billable_bytes,
+            fmt_bytes(a.equal_share_attributed_billable_bytes)
+                AS equal_share_attributed_billable_human,
+            i.pull_count,
+            i.time_created,
+            i.time_last_pulled
+        FROM images i
+        JOIN image_attribution a ON a.image_id = i.id
+        WHERE TRIM(COALESCE(i.version, '')) = ''
+          AND TRIM(COALESCE(i.versions, '')) = ''
+        ORDER BY i.repository_name, i.display_name, i.id
+        """,
+    )
+    write_query_csv(
+        conn,
+        output_dir / "deletion_candidates.csv",
+        [
+            "region",
+            "compartment_id",
+            "repository_name",
+            "repository_id",
+            "repository_image_count",
+            "display_name",
+            "version",
+            "versions",
+            "image_id",
+            "digest",
+            "time_created",
+            "time_last_pulled",
+            "pull_count",
+            "layer_count",
+            "exclusive_billable_bytes",
+            "exclusive_billable_human",
+            "equal_share_attributed_billable_bytes",
+            "equal_share_attributed_billable_human",
+            "exclusive_ratio",
+            "age_days",
+            "last_pulled_age_days",
+            "deletion_candidate_reason",
+        ],
+        """
+        WITH repo_counts AS (
+            SELECT repository_id, COUNT(*) AS repository_image_count
+            FROM images
+            GROUP BY repository_id
+        ),
+        deletion_base AS (
+            SELECT
+                i.region,
+                i.compartment_id,
+                i.repository_name,
+                i.repository_id,
+                rc.repository_image_count,
+                i.display_name,
+                i.version,
+                i.versions,
+                i.id AS image_id,
+                i.digest,
+                i.time_created,
+                i.time_last_pulled,
+                i.pull_count,
+                COALESCE((
+                    SELECT COUNT(*) FROM image_layers il WHERE il.image_id = i.id
+                ), 0) AS layer_count,
+                a.exclusive_billable_bytes,
+                fmt_bytes(a.exclusive_billable_bytes) AS exclusive_billable_human,
+                a.equal_share_attributed_billable_bytes,
+                fmt_bytes(a.equal_share_attributed_billable_bytes)
+                    AS equal_share_attributed_billable_human,
+                CASE
+                    WHEN a.equal_share_attributed_billable_bytes > 0
+                    THEN ROUND(
+                        CAST(a.exclusive_billable_bytes AS REAL)
+                        / a.equal_share_attributed_billable_bytes,
+                        4
+                    )
+                    ELSE 0
+                END AS exclusive_ratio,
+                CASE
+                    WHEN TRIM(COALESCE(i.time_created, '')) <> ''
+                    THEN CAST(julianday('now') - julianday(i.time_created) AS INTEGER)
+                    ELSE NULL
+                END AS age_days,
+                CASE
+                    WHEN TRIM(COALESCE(i.time_last_pulled, '')) <> ''
+                    THEN CAST(julianday('now') - julianday(i.time_last_pulled) AS INTEGER)
+                    ELSE NULL
+                END AS last_pulled_age_days,
+                TRIM(
+                    CASE
+                        WHEN TRIM(COALESCE(i.version, '')) = ''
+                          AND TRIM(COALESCE(i.versions, '')) = ''
+                        THEN 'unversioned image; '
+                        ELSE ''
+                    END
+                    || CASE
+                        WHEN i.pull_count = 0 THEN 'never pulled; '
+                        ELSE ''
+                    END
+                    || CASE
+                        WHEN TRIM(COALESCE(i.time_last_pulled, '')) = ''
+                        THEN 'no last pulled timestamp; '
+                        ELSE ''
+                    END
+                    || CASE
+                        WHEN TRIM(COALESCE(i.time_last_pulled, '')) <> ''
+                          AND CAST(julianday('now') - julianday(i.time_last_pulled)
+                              AS INTEGER) >= ?
+                        THEN 'not pulled within retention window; '
+                        ELSE ''
+                    END
+                    || CASE
+                        WHEN TRIM(COALESCE(i.time_created, '')) <> ''
+                          AND CAST(julianday('now') - julianday(i.time_created)
+                              AS INTEGER) >= ?
+                        THEN 'older than retention window; '
+                        ELSE ''
+                    END
+                    || CASE
+                        WHEN a.exclusive_billable_bytes >= ?
+                        THEN 'high exclusive billable bytes; '
+                        ELSE ''
+                    END
+                    || CASE
+                        WHEN rc.repository_image_count > ?
+                        THEN 'repository exceeds image count limit; '
+                        ELSE ''
+                    END,
+                    '; '
+                ) AS deletion_candidate_reason
+            FROM images i
+            JOIN image_attribution a ON a.image_id = i.id
+            JOIN repo_counts rc ON rc.repository_id = i.repository_id
+        )
+        SELECT
+            region,
+            compartment_id,
+            repository_name,
+            repository_id,
+            repository_image_count,
+            display_name,
+            version,
+            versions,
+            image_id,
+            digest,
+            time_created,
+            time_last_pulled,
+            pull_count,
+            layer_count,
+            exclusive_billable_bytes,
+            exclusive_billable_human,
+            equal_share_attributed_billable_bytes,
+            equal_share_attributed_billable_human,
+            exclusive_ratio,
+            age_days,
+            last_pulled_age_days,
+            deletion_candidate_reason
+        FROM deletion_base
+        WHERE deletion_candidate_reason <> ''
+        ORDER BY
+            exclusive_billable_bytes DESC,
+            equal_share_attributed_billable_bytes DESC,
+            repository_name,
+            display_name,
+            image_id
+        """,
+        (
+            retention_last_pulled_days,
+            retention_created_days,
+            retention_exclusive_bytes,
+            retention_repo_version_limit,
+        ),
     )
 
     repo_expr = (
@@ -1744,6 +2586,52 @@ def write_report_from_db(
         LEFT JOIN images i ON i.id = b.image_id
         GROUP BY l.digest
         ORDER BY l.size_in_bytes DESC, l.digest
+        """,
+    )
+    write_query_csv(
+        conn,
+        output_dir / "unreferenced_layers.csv",
+        [
+            "layer_digest",
+            "size_bytes",
+            "size_human",
+            "time_created",
+        ],
+        """
+        SELECT
+            l.digest AS layer_digest,
+            l.size_in_bytes AS size_bytes,
+            fmt_bytes(l.size_in_bytes) AS size_human,
+            l.time_created
+        FROM layers l
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM image_layers il
+            WHERE il.layer_digest = l.digest
+        )
+        ORDER BY l.size_in_bytes DESC, l.digest
+        """,
+    )
+    write_query_csv(
+        conn,
+        output_dir / "unreferenced_manifests.csv",
+        [
+            "manifest_digest",
+            "size_bytes",
+            "size_human",
+        ],
+        """
+        SELECT
+            m.digest AS manifest_digest,
+            m.size_in_bytes AS size_bytes,
+            fmt_bytes(m.size_in_bytes) AS size_human
+        FROM manifests m
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM image_manifests im
+            WHERE im.manifest_digest = m.digest
+        )
+        ORDER BY m.size_in_bytes DESC, m.digest
         """,
     )
 
@@ -1959,6 +2847,42 @@ def parse_args() -> argparse.Namespace:
         help="Skip layer_refs.csv. Useful when the image-layer edge list is very large.",
     )
     parser.add_argument(
+        "--retention-created-days",
+        type=int,
+        default=90,
+        help=(
+            "Flag deletion candidates created at least this many days ago in "
+            "deletion_candidates.csv. Default: 90."
+        ),
+    )
+    parser.add_argument(
+        "--retention-last-pulled-days",
+        type=int,
+        default=90,
+        help=(
+            "Flag deletion candidates not pulled within this many days in "
+            "deletion_candidates.csv. Default: 90."
+        ),
+    )
+    parser.add_argument(
+        "--retention-repo-version-limit",
+        type=int,
+        default=10,
+        help=(
+            "Flag images in repositories with more than this many scanned images. "
+            "Default: 10."
+        ),
+    )
+    parser.add_argument(
+        "--retention-exclusive-bytes",
+        type=int,
+        default=1024 * 1024 * 1024,
+        help=(
+            "Flag images with at least this many exclusive billable bytes. "
+            "Default: 1073741824 (1 GiB)."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("ocir-storage-report"),
@@ -1979,6 +2903,14 @@ def main() -> int:
         raise SystemExit("--commit-interval must be at least 1.")
     if args.max_pending < 0:
         raise SystemExit("--max-pending cannot be negative.")
+    if args.retention_created_days < 0:
+        raise SystemExit("--retention-created-days cannot be negative.")
+    if args.retention_last_pulled_days < 0:
+        raise SystemExit("--retention-last-pulled-days cannot be negative.")
+    if args.retention_repo_version_limit < 0:
+        raise SystemExit("--retention-repo-version-limit cannot be negative.")
+    if args.retention_exclusive_bytes < 0:
+        raise SystemExit("--retention-exclusive-bytes cannot be negative.")
 
     config = oci.config.from_file(args.config_file, args.profile)
     region = args.region or config.get("region")
@@ -2048,6 +2980,10 @@ def main() -> int:
         include_subtree=args.include_subtree,
         include_ref_lists=args.include_ref_lists,
         skip_layer_refs=args.skip_layer_refs,
+        retention_created_days=args.retention_created_days,
+        retention_last_pulled_days=args.retention_last_pulled_days,
+        retention_repo_version_limit=args.retention_repo_version_limit,
+        retention_exclusive_bytes=args.retention_exclusive_bytes,
         stats=stats,
     )
     conn.close()
