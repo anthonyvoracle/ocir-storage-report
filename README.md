@@ -380,6 +380,21 @@ created with:
 docker manifest inspect --verbose <image> > image.json
 ```
 
+Example:
+
+```bash
+docker manifest inspect --verbose iad.ocir.io/<namespace>/<repo>:<tag> > image1.json
+docker manifest inspect --verbose iad.ocir.io/<namespace>/<repo>:<other-tag> > image2.json
+
+./manifest_footprint.py image1.json image2.json
+```
+
+To also emit per-layer CSV output:
+
+```bash
+./manifest_footprint.py image1.json image2.json --csv > manifest_layers.csv
+```
+
 The script expects each input file to be a platform-specific image manifest with
 a top-level `layers` array. It skips manifest lists and image indexes because
 those point to platform manifests rather than directly listing layer blobs.
