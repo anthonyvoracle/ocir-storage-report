@@ -27,6 +27,9 @@ unique layer bytes + unique image manifest bytes
 
 OCI billing exports remain the source of truth for invoiced charges. This report
 is intended for operational visibility and chargeback-style attribution.
+Human-readable storage values are displayed with decimal units (`KB`, `MB`,
+`GB`) to make comparison with OCI Cost Analysis easier. Raw `*_bytes` columns
+remain exact byte counts.
 
 ## Requirements
 
@@ -56,7 +59,7 @@ The default profile is `DEFAULT`.
 Run a report for one region:
 
 ```bash
-cd ocir-storage-report
+cd ocir-report
 source .venv/bin/activate
 ./ocir_storage_report.py --region us-ashburn-1 --output-dir ./out
 ```
@@ -104,7 +107,9 @@ resume and concurrency options:
   --state-db ./out-iad/ocir_inventory.sqlite \
   --workers 32 \
   --commit-interval 1000 \
-  --skip-layer-refs
+  --skip-layer-refs \
+  --retention-last-pulled-days 180 \
+  --retention-created-days 180
 ```
 
 The script writes fetched image metadata to the state database as it runs. If the
@@ -138,7 +143,7 @@ Useful large-run options:
 - `--retention-repo-version-limit`: Flag images in repositories with more than
   this many scanned images. Default: `10`.
 - `--retention-exclusive-bytes`: Flag images with at least this many exclusive
-  billable bytes. Default: `1073741824` (1 GiB).
+  billable bytes. Default: `1000000000` (1 GB).
 
 For sharding, run the script per repository OCID:
 

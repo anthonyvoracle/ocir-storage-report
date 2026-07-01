@@ -132,12 +132,12 @@ def list_to_str(values: Sequence[str]) -> str:
 
 
 def fmt_bytes(n: int) -> str:
-    units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
     value = float(n)
     for unit in units:
-        if value < 1024.0 or unit == units[-1]:
+        if value < 1000.0 or unit == units[-1]:
             return f"{value:.2f} {unit}"
-        value /= 1024.0
+        value /= 1000.0
     return f"{n} B"
 
 
@@ -1279,7 +1279,7 @@ def write_storage_visuals(
         retention_policy.get("repository_image_limit", 10)
     )
     retention_exclusive_bytes = int(
-        retention_policy.get("exclusive_bytes", 1024 * 1024 * 1024)
+        retention_policy.get("exclusive_bytes", 1000 * 1000 * 1000)
     )
     retention_criteria_rows = query_rows(
         conn,
@@ -2073,7 +2073,7 @@ def write_report_from_db(
     retention_created_days: int = 90,
     retention_last_pulled_days: int = 90,
     retention_repo_version_limit: int = 10,
-    retention_exclusive_bytes: int = 1024 * 1024 * 1024,
+    retention_exclusive_bytes: int = 1000 * 1000 * 1000,
     stats: Optional[Dict[str, int]] = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2876,10 +2876,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--retention-exclusive-bytes",
         type=int,
-        default=1024 * 1024 * 1024,
+        default=1000 * 1000 * 1000,
         help=(
             "Flag images with at least this many exclusive billable bytes. "
-            "Default: 1073741824 (1 GiB)."
+            "Default: 1000000000 (1 GB)."
         ),
     )
     parser.add_argument(
