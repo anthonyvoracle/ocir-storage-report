@@ -59,7 +59,7 @@ The default profile is `DEFAULT`.
 Run a report for one region:
 
 ```bash
-cd ocir-storage-report
+cd ocir-report
 source .venv/bin/activate
 ./ocir_storage_report.py --region us-ashburn-1 --output-dir ./out
 ```
@@ -368,6 +368,33 @@ estimated billable total.
 
 ## Related Script
 
-`ocir-footprint-script.py` is an offline manifest calculator. It reads local
+`ocir_footprint_script.py` is an offline manifest calculator. It reads local
 manifest JSON files and deduplicates layers across those files. It is useful for
-experiments, but it does not inventory OCIR resources from OCI.
+experiments, but it does not inventory OCIR resources from OCI and is not used
+by `ocir_storage_report.py`.
+
+Use it when you already have image manifest JSON files, for example files
+created with:
+
+```bash
+docker manifest inspect --verbose <image> > image.json
+```
+
+The script expects each input file to be a platform-specific image manifest with
+a top-level `layers` array. It skips manifest lists and image indexes because
+those point to platform manifests rather than directly listing layer blobs.
+
+For the manifest files you pass in, it reports:
+
+- Per-image layer totals.
+- Naive image-size total, where shared layers are counted once per image.
+- Unique-layer total, where each layer digest is counted once.
+- Deduplication savings between the naive total and unique-layer total.
+- Top shared layers by reference count.
+- Optional per-layer CSV output with `--csv`.
+
+This helper is best for quick local experiments, spot-checking a small set of
+images, or explaining layer deduplication with concrete manifest files. The
+tenancy-wide dashboard, SQLite state, OCI API inventory, retention/deletion
+candidate CSVs, and repository attribution reports are all produced by
+`ocir_storage_report.py`.
