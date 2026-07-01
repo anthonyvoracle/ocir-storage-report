@@ -368,7 +368,7 @@ estimated billable total.
 
 ## Related Script
 
-`ocir_footprint_script.py` is an offline manifest calculator. It reads local
+`manifest_footprint.py` is an offline manifest calculator. It reads local image
 manifest JSON files and deduplicates layers across those files. It is useful for
 experiments, but it does not inventory OCIR resources from OCI and is not used
 by `ocir_storage_report.py`.
@@ -393,7 +393,9 @@ For the manifest files you pass in, it reports:
 - Top shared layers by reference count.
 - Optional per-layer CSV output with `--csv`.
 
-This helper is best for quick local experiments, spot-checking a small set of
+This helper is registry-agnostic: it can analyze compatible manifest JSON from
+OCIR, Docker Hub, or another OCI/Docker registry because it only reads local
+files. It is best for quick local experiments, spot-checking a small set of
 images, or explaining layer deduplication with concrete manifest files. The
 tenancy-wide dashboard, SQLite state, OCI API inventory, retention/deletion
 candidate CSVs, and repository attribution reports are all produced by
