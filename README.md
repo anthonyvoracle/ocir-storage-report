@@ -59,7 +59,7 @@ The default profile is `DEFAULT`.
 Run a report for one region:
 
 ```bash
-cd ocir-report
+cd ocir-storage-report
 source .venv/bin/activate
 ./ocir_storage_report.py --region us-ashburn-1 --output-dir ./out
 ```
